@@ -1,429 +1,78 @@
 <?php
 declare(strict_types=1);
 
+require 'helpers.php'; // Load helper functions (environment loader, logging, signature check, etc.)
+
+// Enable error display for debugging
 ini_set('display_errors', '1');
 error_reporting(E_ALL);
 
 // ===== Load .env with flexible spacing =====
-function loadEnv(string $envPath): void
-{
-    if (!file_exists($envPath)) return;
-    $lines = file($envPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    foreach ($lines as $line) {
-        if (str_starts_with(trim($line), '#') || strpos($line, '=') === false) continue;
-        [$key, $value] = preg_split('/\s*=\s*/', $line, 2);
-        if ($key !== null && $value !== null) {
-            $_ENV[trim($key)] = trim($value);
-        }
-    }
-}
+loadEnv(__DIR__ . '/.env'); // Load environment variables from .env file
 
-loadEnv(__DIR__ . '/.env');
-
-$storageRoot = __DIR__ . '/' . ($_ENV['STORAGE_ROOT'] ?? '../data');
-$logFile = __DIR__ . '/' . ($_ENV['LOG_FILE'] ?? 'activities.log');
-$accessKey = $_ENV['ACCESS_KEY'] ?? '';
-$secretKey = $_ENV['SECRET_KEY'] ?? '';
-$canLog = true;
+// ===== Environment variables and paths =====
+$debug = envToBool($_ENV['DEBUG'] ?? false); // Enable debug mode if DEBUG=true
+$accessKey = $_ENV['ACCESS_KEY'] ?? '';       // AWS-like access key for authentication
+$secretKey = $_ENV['SECRET_KEY'] ?? '';       // AWS-like secret key for signature verification
+$storageRoot = __DIR__ . '/' . ($_ENV['STORAGE_ROOT'] ?? '../data'); // Storage root path for file storage
+$logFile = __DIR__ . '/' . ($_ENV['LOG_FILE'] ?? 'activities.log');  // Log file location
 
 // ===== Fatal Error Logging =====
 set_exception_handler(function ($e) {
     global $logFile;
+
+    // Log the unhandled exception
     file_put_contents($logFile, "[EXCEPTION] " . $e->getMessage() . PHP_EOL, FILE_APPEND);
+
+    // Respond with 500 Internal Error in AWS S3 XML error format
     http_response_code(500);
     header('Content-Type: application/xml');
     echo "<Error><Code>InternalError</Code><Message>Unhandled Exception</Message></Error>";
     exit;
 });
 
-// ===== Logging Helper =====
-function logMessage(string $message): void
-{
-    global $canLog, $logFile;
-    if ($canLog) {
-        file_put_contents($logFile, "[" . date('Y-m-d H:i:s') . "] " . $message . PHP_EOL, FILE_APPEND);
-    }
-}
-
-// ===== XML Element Helper =====
-function xmlElement(string $tag, string $content): string
-{
-    return "<{$tag}>" . htmlspecialchars($content, ENT_XML1) . "</{$tag}>";
-}
-
-// ===== Parse AWS Signature V4 Authorization Header =====
-function parseAuthorization(string $header): array
-{
-    preg_match('/Credential=([^\/]+)\/([\d]{8})\/([^\/]+)\/s3\/aws4_request/', $header, $c);
-    preg_match('/SignedHeaders=([^,]+)/', $header, $s);
-    preg_match('/Signature=([0-9a-f]+)/', $header, $sig);
-    return ['AK' => $c[1] ?? '', 'Date' => $c[2] ?? '', 'SHA' => $c[3] ?? '', 'Signed' => $s[1] ?? '', 'Sig' => $sig[1] ?? ''];
-}
-
-// ===== Generate AWS Signing Key =====
-function getSigningKey(string $date, string $region, string $service): string
-{
-    global $secretKey;
-    $kDate = hash_hmac('sha256', $date, "AWS4{$secretKey}", true);
-    $kRegion = hash_hmac('sha256', $region, $kDate, true);
-    $kService = hash_hmac('sha256', $service, $kRegion, true);
-    return hash_hmac('sha256', 'aws4_request', $kService, true);
-}
-
-// ===== Signature Verification =====
-function checkSignature(): void
-{
-    $hdr = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
-    logMessage("Authorization Header: $hdr");
-
-    $auth = parseAuthorization($hdr);
-    logMessage("Parsed Auth: " . json_encode($auth));
-
-    if ($auth['AK'] !== $GLOBALS['accessKey']) {
-        http_response_code(403);
-        header('Content-Type: application/xml');
-        logMessage("Access Key mismatch");
-        echo "<Error><Code>AccessDenied</Code><Message>Invalid Access Key</Message></Error>";
-        exit;
-    }
-
-    $method = $_SERVER['REQUEST_METHOD'];
-    $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-    $qs = $_SERVER['QUERY_STRING'] ?? '';
-
-    $canonicalQueryString = '';
-    if ($qs) {
-        parse_str($qs, $queryParts);
-        ksort($queryParts);
-        $canonicalQueryString = http_build_query($queryParts, '', '&', PHP_QUERY_RFC3986);
-    }
-
-    $signedHeaders = explode(';', $auth['Signed']);
-    $canonicalHeaders = '';
-
-    foreach ($signedHeaders as $h) {
-        $headerName = strtolower($h);
-        if ($headerName === 'host') {
-            $val = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'];
-        } elseif ($headerName === 'content-type') {
-            $val = $_SERVER['CONTENT_TYPE'] ?? '';
-        } elseif ($headerName === 'x-amz-date') {
-            $val = $_SERVER['HTTP_X_AMZ_DATE'] ?? '';
-        } elseif ($headerName === 'x-amz-content-sha256') {
-            $val = $_SERVER['HTTP_X_AMZ_CONTENT_SHA256'] ?? '';
-        } else {
-            $key = 'HTTP_' . strtoupper(str_replace('-', '_', $headerName));
-            $val = $_SERVER[$key] ?? '';
-        }
-        $canonicalHeaders .= $headerName . ':' . trim($val) . "\n";
-    }
-
-    $hashedPayload = $_SERVER['HTTP_X_AMZ_CONTENT_SHA256'] ?? '';
-    if (!$hashedPayload) {
-        $payload = file_get_contents('php://input');
-        $hashedPayload = hash('sha256', $payload);
-    }
-
-    $canonicalRequest = $method . "\n" .
-        $path . "\n" .
-        $canonicalQueryString . "\n" .
-        $canonicalHeaders . "\n" .
-        $auth['Signed'] . "\n" .
-        $hashedPayload;
-
-    logMessage("CanonicalRequest:\n" . $canonicalRequest);
-
-    $amzDate = $_SERVER['HTTP_X_AMZ_DATE'] ?? '';
-    if (!$amzDate) {
-        http_response_code(403);
-        header('Content-Type: application/xml');
-        logMessage("Missing x-amz-date header");
-        echo "<Error><Code>MissingDate</Code><Message>x-amz-date header missing</Message></Error>";
-        exit;
-    }
-
-    $stringToSign = "AWS4-HMAC-SHA256\n" .
-        $amzDate . "\n" .
-        $auth['Date'] . "/us-east-1/s3/aws4_request\n" .
-        hash('sha256', $canonicalRequest);
-
-    logMessage("StringToSign:\n" . $stringToSign);
-
-    $signingKey = getSigningKey($auth['Date'], 'us-east-1', 's3');
-    $calcSig = hash_hmac('sha256', $stringToSign, $signingKey);
-
-    logMessage("Calculated Signature: $calcSig");
-
-    if (!hash_equals($calcSig, $auth['Sig'])) {
-        http_response_code(403);
-        header('Content-Type: application/xml');
-        logMessage("Signature mismatch");
-        echo "<Error><Code>SignatureDoesNotMatch</Code><Message>Calculated: $calcSig | Received: {$auth['Sig']}</Message></Error>";
-        exit;
-    }
-
-    logMessage("Signature OK");
-}
-
-// ===== Request Start =====
+// ===== Request Start Logging =====
 logMessage("======== NEW REQUEST ========");
 logMessage($_SERVER['REQUEST_METHOD'] . ' ' . $_SERVER['REQUEST_URI']);
+
+// Log all request headers
 foreach (getallheaders() as $name => $value) {
     logMessage("Header: $name: $value");
 }
 
-checkSignature();
+// ===== Signature Verification =====
+checkSignature(); // Validate AWS Signature V4 authorization header
 
-// ===== Parse Bucket and Key =====
-$path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-$uri = trim($path, '/');
-$parts = explode('/', $uri, 2);
-$bucket = $parts[0] ?? '';
-$key = $parts[1] ?? '';
-$bucketDir = "$storageRoot/$bucket";
+// ===== Parse Bucket and Key from URL path =====
+$path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH); // Extract request path
+$uri = trim($path, '/');                                  // Remove leading and trailing slashes
+$parts = explode('/', $uri, 2);                           // Split into bucket and key parts
+$bucket = $parts[0] ?? '';                                // Bucket name
+$key = $parts[1] ?? '';                                   // Object key inside the bucket
+$bucketDir = "$storageRoot/$bucket";                      // Local filesystem path for the bucket
+
 logMessage("Parsed bucket: '$bucket' | key: '$key' | dir: '$bucketDir'");
 
+// ===== Route by HTTP Method =====
 $method = $_SERVER['REQUEST_METHOD'];
 
 switch ($method) {
     case 'PUT':
-        if ($bucket !== '' && $key === '') {
-            // Create Bucket
-            if (!is_dir($bucketDir)) {
-                if (!mkdir($bucketDir, 0777, true)) {
-                    http_response_code(500);
-                    header('Content-Type: application/xml');
-                    logMessage("Failed to create bucket: $bucketDir");
-                    echo "<Error><Code>InternalError</Code><Message>Could not create bucket directory</Message></Error>";
-                    exit;
-                }
-                http_response_code(200);
-                header('Content-Type: application/xml');
-                echo "<CreateBucketResult><Location>/$bucket</Location></CreateBucketResult>";
-                logMessage("Bucket created: $bucket");
-            } else {
-                http_response_code(409);
-                header('Content-Type: application/xml');
-                echo "<Error><Code>BucketAlreadyExists</Code><Message>Bucket already exists</Message></Error>";
-                logMessage("Bucket already exists: $bucket");
-            }
-        } else {
-            // Upload Object
-
-            // Ensure subdirectories exist
-            $fullPath = "$bucketDir/$key";
-            $dirPath = dirname($fullPath);
-            if (!is_dir($dirPath)) {
-                mkdir($dirPath, 0777, true);
-            }
-
-            $out = fopen($fullPath, 'w');
-            $in = fopen('php://input', 'r');
-
-            $isChunked = ($_SERVER['HTTP_X_AMZ_CONTENT_SHA256'] ?? '') === 'STREAMING-UNSIGNED-PAYLOAD-TRAILER';
-            logMessage("Upload mode: " . ($isChunked ? 'aws-chunked' : 'normal'));
-
-            if ($isChunked) {
-                while (true) {
-                    $chunkHeader = fgets($in);
-                    if ($chunkHeader === false) break;
-
-                    $chunkHeader = trim($chunkHeader);
-                    if ($chunkHeader === '') continue;
-
-                    // Ignore any chunk extensions (like ";chunk-signature=...")
-                    $semiPos = strpos($chunkHeader, ';');
-                    $sizeHex = $semiPos !== false ? substr($chunkHeader, 0, $semiPos) : $chunkHeader;
-
-                    if (!ctype_xdigit($sizeHex)) {
-                        logMessage("Invalid chunk size header: '$chunkHeader'");
-                        break;
-                    }
-
-                    $chunkSize = hexdec($sizeHex);
-                    if ($chunkSize === 0) {
-                        // Read trailer headers until empty line
-                        while (($line = fgets($in)) !== false) {
-                            if (trim($line) === '') break;
-                        }
-                        logMessage("Reached final chunk (size=0)");
-                        break;
-                    }
-
-                    $remaining = $chunkSize;
-                    while ($remaining > 0) {
-                        $buffer = fread($in, min(8192, $remaining));
-                        if ($buffer === false || strlen($buffer) === 0) {
-                            logMessage("EOF or error while reading chunk data");
-                            break 2;
-                        }
-                        fwrite($out, $buffer);
-                        $remaining -= strlen($buffer);
-                    }
-
-                    // Consume CRLF after each chunk
-                    fgets($in);
-                }
-            } else {
-                // Non-chunked payload
-                while (!feof($in)) {
-                    $buffer = fread($in, 8192);
-                    if ($buffer !== false) fwrite($out, $buffer);
-                }
-            }
-
-            fclose($in);
-            fclose($out);
-            logMessage("Object saved ($bucket/$key)");
-
-            http_response_code(200);
-            header('Content-Type: application/xml');
-            echo "<PutObjectResult/>";
-        }
+        processMethodPut($bucket, $key, $bucketDir);    // Handle bucket creation or object upload
         break;
 
     case 'HEAD':
-        if ($key !== '') {
-            $f = "$bucketDir/$key";
-            $realPath = realpath($f);
-
-            logMessage("HEAD request for key='$key' | Full path='$f' | Realpath='$realPath'");
-
-            if ($realPath !== false && is_file($realPath)) {
-                header('Content-Type: application/octet-stream');
-                http_response_code(200);
-                logMessage("HEAD 200 OK: $realPath");
-                // Never echo on HEAD OK
-            } else {
-                http_response_code(404);
-                header('Content-Type: application/xml');
-                echo "<Error><Code>NoSuchKey</Code><Message>Object not found</Message></Error>";
-                logMessage("HEAD 404 Not Found: $f");
-            }
-        } else {
-            http_response_code(400);
-            header('Content-Type: application/xml');
-            echo "<Error><Code>InvalidRequest</Code><Message>HEAD request without key</Message></Error>";
-            logMessage("HEAD 400 Invalid: bucket='$bucket' key='$key'");
-        }
+        processMethodHead($key, $bucketDir, $bucket);   // Handle HEAD request for object metadata
         break;
 
     case 'GET':
-        if ($key !== '') {
-            // Download Object
-            $f = "$bucketDir/$key";
-            if (is_file($f)) {
-                header('Content-Type: application/octet-stream');
-                readfile($f);
-                logMessage("Object read: $bucket/$key");
-            } elseif (is_dir($f)) {
-                // Prevent directory GET - S3 never returns content for directories
-                http_response_code(404);
-                header('Content-Type: application/xml');
-                echo "<Error><Code>NoSuchKey</Code><Message>Expected a file but found a directory</Message></Error>";
-                logMessage("GET attempted on a directory (invalid): $bucket/$key");
-            } else {
-                http_response_code(404);
-                header('Content-Type: application/xml');
-                echo "<Error><Code>NoSuchKey</Code><Message>Object not found</Message></Error>";
-                logMessage("Object not found: $bucket/$key");
-            }
-        } else {
-            // List Objects in Bucket
-            logMessage("Checking bucket directory: $bucketDir");
-            if (!is_dir($bucketDir)) {
-                http_response_code(404);
-                header('Content-Type: application/xml');
-                echo "<Error><Code>NoSuchBucket</Code><Message>Bucket not found</Message></Error>";
-                logMessage("Bucket not found: $bucketDir");
-                exit;
-            }
-            $objects = listObjectsRecursively($bucketDir);
-            header('Content-Type: application/xml');
-            echo "<ListBucketResult>" . xmlElement('Name', $bucket);
-            foreach ($objects as $o) {
-                echo "<Contents>" . xmlElement('Key', $o) . "</Contents>";
-            }
-            echo "</ListBucketResult>";
-            logMessage("ListBucket: $bucket");
-        }
+        processMethodGet($key, $bucketDir, $bucket);    // Handle GET for download or list bucket
         break;
 
     case 'DELETE':
-        if ($bucket !== '' && $key === '') {
-            // Delete Bucket (recursively)
-            if (!is_dir($bucketDir)) {
-                http_response_code(404);
-                header('Content-Type: application/xml');
-                echo "<Error><Code>NoSuchBucket</Code><Message>Bucket not found</Message></Error>";
-                logMessage("Bucket not found for deletion: $bucketDir");
-                exit;
-            }
-
-            // Recursive delete helper
-            function deleteDirectory(string $dir): bool
-            {
-                $items = array_diff(scandir($dir), ['.', '..']);
-                foreach ($items as $item) {
-                    $path = "$dir/$item";
-                    if (is_dir($path)) {
-                        deleteDirectory($path);
-                    } else {
-                        unlink($path);
-                    }
-                }
-                return rmdir($dir);
-            }
-
-            if (deleteDirectory($bucketDir)) {
-                http_response_code(204);
-                logMessage("Bucket deleted recursively: $bucket");
-            } else {
-                http_response_code(500);
-                header('Content-Type: application/xml');
-                echo "<Error><Code>InternalError</Code><Message>Failed to delete bucket directory</Message></Error>";
-                logMessage("Failed to delete bucket directory: $bucketDir");
-            }
-        } elseif ($key !== '') {
-            // Delete Object
-            $f = "$bucketDir/$key";
-            if (is_file($f)) {
-                unlink($f);
-                http_response_code(204);
-                logMessage("Object deleted: $bucket/$key");
-            } else {
-                http_response_code(404);
-                header('Content-Type: application/xml');
-                echo "<Error><Code>NoSuchKey</Code><Message>Object not found</Message></Error>";
-                logMessage("Delete failed, not found: $bucket/$key");
-            }
-        } else {
-            http_response_code(400);
-            header('Content-Type: application/xml');
-            echo "<Error><Code>InvalidRequest</Code><Message>Invalid DELETE request</Message></Error>";
-            logMessage("Invalid DELETE request: bucket='$bucket' key='$key'");
-        }
+        processMethodDelete($bucket, $key, $bucketDir); // Handle object or bucket deletion
         break;
 
     default:
-        http_response_code(405);
-        header('Content-Type: application/xml');
-        echo "<Error><Code>MethodNotAllowed</Code><Message>Invalid method</Message></Error>";
-        logMessage("Method not allowed: $method");
-}
-
-function listObjectsRecursively(string $dir, string $prefix = ''): array
-{
-    $result = [];
-    $items = array_diff(scandir($dir), ['.', '..']);
-    foreach ($items as $item) {
-        $path = "$dir/$item";
-        $key = $prefix . $item;
-        if (is_dir($path)) {
-            $result = array_merge($result, listObjectsRecursively($path, $key . '/'));
-        } else {
-            $result[] = $key;
-        }
-    }
-    return $result;
+        unknownMethod($method);                         // Respond with 405 for unsupported HTTP methods
 }
