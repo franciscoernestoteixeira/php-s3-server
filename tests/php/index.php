@@ -1,17 +1,17 @@
 <?php
 require 'vendor/autoload.php';
 
-use Aws\S3\S3Client;
 use Aws\Exception\AwsException;
+use Aws\S3\S3Client;
 
 // Disable SSL verification (use only in testing/self-signed environments)
 $s3Config = [
     'version' => 'latest',
     'region' => 'us-east-1',
-    'endpoint' => 'https://api.storage.flisol.app',
+    'endpoint' => 'http://localhost',
     'credentials' => [
-        'key'    => 'AKIANW75XJAQI7FV27P4',
-        'secret' => 'kByKHM67J3OkG196kkdGc/CoDNqu0ILuupqXpO2Ri8I=',
+        'key' => 'FAKEACCESS',
+        'secret' => 'FAKESECRET',
     ],
     'use_path_style_endpoint' => true,
     'http' => [
@@ -43,8 +43,8 @@ $body = 'Hello World from PHP';
 try {
     $s3->putObject([
         'Bucket' => $bucket,
-        'Key'    => $textKey,
-        'Body'   => $body,
+        'Key' => $textKey,
+        'Body' => $body,
         'ContentLength' => strlen($body),
     ]);
     echo "Uploaded: {$textKey}\n";
@@ -58,8 +58,8 @@ function uploadFile($s3, $bucket, $filePath, $key)
     try {
         $s3->putObject([
             'Bucket' => $bucket,
-            'Key'    => $key,
-            'Body'   => fopen($filePath, 'rb'),
+            'Key' => $key,
+            'Body' => fopen($filePath, 'rb'),
             'ContentLength' => filesize($filePath),
         ]);
         echo "Uploaded: {$key}\n";
@@ -96,7 +96,7 @@ foreach ($contents as $obj) {
     try {
         $result = $s3->getObject([
             'Bucket' => $bucket,
-            'Key'    => $key,
+            'Key' => $key,
         ]);
         file_put_contents($destPath, $result['Body']);
         echo "Downloaded: {$destPath}\n";
@@ -111,7 +111,7 @@ foreach ($contents as $obj) {
     try {
         $s3->deleteObject([
             'Bucket' => $bucket,
-            'Key'    => $key,
+            'Key' => $key,
         ]);
         echo "Deleted: {$key}\n";
     } catch (AwsException $e) {
