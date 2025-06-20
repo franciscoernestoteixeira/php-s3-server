@@ -209,8 +209,15 @@ switch ($method) {
             }
         } else {
             // Upload Object
-            if (!is_dir($bucketDir)) mkdir($bucketDir, 0777, true);
-            $out = fopen("$bucketDir/$key", 'w');
+
+            // Ensure subdirectories exist
+            $fullPath = "$bucketDir/$key";
+            $dirPath = dirname($fullPath);
+            if (!is_dir($dirPath)) {
+                mkdir($dirPath, 0777, true);
+            }
+
+            $out = fopen($fullPath, 'w');
             $in = fopen('php://input', 'r');
 
             $isChunked = ($_SERVER['HTTP_X_AMZ_CONTENT_SHA256'] ?? '') === 'STREAMING-UNSIGNED-PAYLOAD-TRAILER';
@@ -299,10 +306,10 @@ switch ($method) {
                 logMessage("Bucket not found: $bucketDir");
                 exit;
             }
-            $objs = array_diff(scandir($bucketDir), ['.', '..']);
+            $objects = listObjectsRecursively($bucketDir);
             header('Content-Type: application/xml');
             echo "<ListBucketResult>" . xmlElement('Name', $bucket);
-            foreach ($objs as $o) {
+            foreach ($objects as $o) {
                 echo "<Contents>" . xmlElement('Key', $o) . "</Contents>";
             }
             echo "</ListBucketResult>";
@@ -371,4 +378,20 @@ switch ($method) {
         header('Content-Type: application/xml');
         echo "<Error><Code>MethodNotAllowed</Code><Message>Invalid method</Message></Error>";
         logMessage("Method not allowed: $method");
+}
+
+function listObjectsRecursively(string $dir, string $prefix = ''): array
+{
+    $result = [];
+    $items = array_diff(scandir($dir), ['.', '..']);
+    foreach ($items as $item) {
+        $path = "$dir/$item";
+        $key = $prefix . $item;
+        if (is_dir($path)) {
+            $result = array_merge($result, listObjectsRecursively($path, $key . '/'));
+        } else {
+            $result[] = $key;
+        }
+    }
+    return $result;
 }
