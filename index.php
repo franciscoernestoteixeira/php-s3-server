@@ -208,35 +208,67 @@ switch ($method) {
                 logMessage("Bucket already exists: $bucket");
             }
         } else {
-            // PutObject
+            // Upload Object
             if (!is_dir($bucketDir)) mkdir($bucketDir, 0777, true);
-            if (($_SERVER['HTTP_X_AMZ_CONTENT_SHA256'] ?? '') === 'STREAMING-UNSIGNED-PAYLOAD-TRAILER') {
-                $in = fopen('php://input', 'r');
-                $out = fopen("$bucketDir/$key", 'w');
-                while (!feof($in)) {
-                    $chunkSizeHex = trim(fgets($in));
-                    if ($chunkSizeHex === '' || $chunkSizeHex === '0') break;
-                    $chunkSize = hexdec($chunkSizeHex);
-                    if ($chunkSize > 0) {
-                        $data = fread($in, $chunkSize);
-                        fwrite($out, $data);
+            $out = fopen("$bucketDir/$key", 'w');
+            $in = fopen('php://input', 'r');
+
+            $isChunked = ($_SERVER['HTTP_X_AMZ_CONTENT_SHA256'] ?? '') === 'STREAMING-UNSIGNED-PAYLOAD-TRAILER';
+            logMessage("Upload mode: " . ($isChunked ? 'aws-chunked' : 'normal'));
+
+            if ($isChunked) {
+                while (true) {
+                    $chunkHeader = fgets($in);
+                    if ($chunkHeader === false) break;
+
+                    $chunkHeader = trim($chunkHeader);
+                    if ($chunkHeader === '') continue;
+
+                    // Ignore any chunk extensions (like ";chunk-signature=...")
+                    $semiPos = strpos($chunkHeader, ';');
+                    $sizeHex = $semiPos !== false ? substr($chunkHeader, 0, $semiPos) : $chunkHeader;
+
+                    if (!ctype_xdigit($sizeHex)) {
+                        logMessage("Invalid chunk size header: '$chunkHeader'");
+                        break;
                     }
+
+                    $chunkSize = hexdec($sizeHex);
+                    if ($chunkSize === 0) {
+                        // Read trailer headers until empty line
+                        while (($line = fgets($in)) !== false) {
+                            if (trim($line) === '') break;
+                        }
+                        logMessage("Reached final chunk (size=0)");
+                        break;
+                    }
+
+                    $remaining = $chunkSize;
+                    while ($remaining > 0) {
+                        $buffer = fread($in, min(8192, $remaining));
+                        if ($buffer === false || strlen($buffer) === 0) {
+                            logMessage("EOF or error while reading chunk data");
+                            break 2;
+                        }
+                        fwrite($out, $buffer);
+                        $remaining -= strlen($buffer);
+                    }
+
+                    // Consume CRLF after each chunk
                     fgets($in);
                 }
-                fclose($in);
-                fclose($out);
-                logMessage("Object saved (chunked): $bucket/$key");
             } else {
-                $payload = file_get_contents('php://input');
-                if (file_put_contents("$bucketDir/$key", $payload) === false) {
-                    http_response_code(500);
-                    header('Content-Type: application/xml');
-                    logMessage("Failed to save object: $bucket/$key");
-                    echo "<Error><Code>InternalError</Code><Message>Could not write object</Message></Error>";
-                    exit;
+                // Non-chunked payload
+                while (!feof($in)) {
+                    $buffer = fread($in, 8192);
+                    if ($buffer !== false) fwrite($out, $buffer);
                 }
-                logMessage("Object saved (non-chunked): $bucket/$key");
             }
+
+            fclose($in);
+            fclose($out);
+            logMessage("Object saved ($bucket/$key)");
+
             http_response_code(200);
             header('Content-Type: application/xml');
             echo "<PutObjectResult/>";
@@ -245,7 +277,7 @@ switch ($method) {
 
     case 'GET':
         if ($key !== '') {
-            // GetObject
+            // Download Object
             $f = "$bucketDir/$key";
             if (is_file($f)) {
                 header('Content-Type: application/octet-stream');
@@ -258,7 +290,7 @@ switch ($method) {
                 logMessage("Object not found: $bucket/$key");
             }
         } else {
-            // ListObjects
+            // List Objects in Bucket
             logMessage("Checking bucket directory: $bucketDir");
             if (!is_dir($bucketDir)) {
                 http_response_code(404);
@@ -280,7 +312,7 @@ switch ($method) {
 
     case 'DELETE':
         if ($bucket !== '' && $key === '') {
-            // DeleteBucket (recursive)
+            // Delete Bucket (recursively)
             if (!is_dir($bucketDir)) {
                 http_response_code(404);
                 header('Content-Type: application/xml');
@@ -314,7 +346,7 @@ switch ($method) {
                 logMessage("Failed to delete bucket directory: $bucketDir");
             }
         } elseif ($key !== '') {
-            // DeleteObject
+            // Delete Object
             $f = "$bucketDir/$key";
             if (is_file($f)) {
                 unlink($f);
