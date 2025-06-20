@@ -1,0 +1,15 @@
+# Enable Rewrite Engine
+RewriteEngine On
+
+# Deny direct access to the storage/data directory
+RewriteRule ^(data|storage)/ - [F,L]
+
+# Allow additional HTTP methods
+<LimitExcept GET POST OPTIONS HEAD PUT DELETE>
+    Require all granted
+</LimitExcept>
+
+# Route all other requests to index.php (unless file or dir exists)
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [L]
