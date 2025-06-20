@@ -282,6 +282,32 @@ switch ($method) {
         }
         break;
 
+    case 'HEAD':
+        if ($key !== '') {
+            $f = "$bucketDir/$key";
+            $realPath = realpath($f);
+
+            logMessage("HEAD request for key='$key' | Full path='$f' | Realpath='$realPath'");
+
+            if ($realPath !== false && is_file($realPath)) {
+                header('Content-Type: application/octet-stream');
+                http_response_code(200);
+                logMessage("HEAD 200 OK: $realPath");
+                // Never echo on HEAD OK
+            } else {
+                http_response_code(404);
+                header('Content-Type: application/xml');
+                echo "<Error><Code>NoSuchKey</Code><Message>Object not found</Message></Error>";
+                logMessage("HEAD 404 Not Found: $f");
+            }
+        } else {
+            http_response_code(400);
+            header('Content-Type: application/xml');
+            echo "<Error><Code>InvalidRequest</Code><Message>HEAD request without key</Message></Error>";
+            logMessage("HEAD 400 Invalid: bucket='$bucket' key='$key'");
+        }
+        break;
+
     case 'GET':
         if ($key !== '') {
             // Download Object
@@ -290,6 +316,12 @@ switch ($method) {
                 header('Content-Type: application/octet-stream');
                 readfile($f);
                 logMessage("Object read: $bucket/$key");
+            } elseif (is_dir($f)) {
+                // Prevent directory GET - S3 never returns content for directories
+                http_response_code(404);
+                header('Content-Type: application/xml');
+                echo "<Error><Code>NoSuchKey</Code><Message>Expected a file but found a directory</Message></Error>";
+                logMessage("GET attempted on a directory (invalid): $bucket/$key");
             } else {
                 http_response_code(404);
                 header('Content-Type: application/xml');
