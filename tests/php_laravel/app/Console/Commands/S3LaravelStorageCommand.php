@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Storage;
+use Symfony\Component\Console\Command\Command as CommandAlias;
 
 class S3LaravelStorageCommand extends Command
 {
@@ -24,51 +25,53 @@ class S3LaravelStorageCommand extends Command
     /**
      * Execute the console command.
      */
-    public function handle(): void
+    public function handle(): int
     {
         $disk = Storage::disk('s3');
-        $localDisk = Storage::disk('local'); // This is storage/app
+        $localDisk = Storage::disk('local');
         $bucket = config('filesystems.disks.s3.bucket');
         $timestamp = time();
 
-        // 1. Upload a sample text file (created in storage/app)
-        $localTextPath = "uploads/{$timestamp}_hello.txt";
-        $localDisk->put($localTextPath, 'Hello World from Laravel Storage');
-        $disk->put(basename($localTextPath), $localDisk->get($localTextPath));
-        $this->info("Uploaded: " . basename($localTextPath));
+        // Upload simple text file
+        $textKey = "{$timestamp}_hello.txt";
+        $disk->put($textKey, 'Hello World from Laravel');
+        $this->info("Uploaded: {$textKey}");
 
-        // 2. Upload sample.png and sample.jpg from storage/app/uploads/
+        // Upload sample files if they exist
         foreach (['sample.png', 'sample.jpg'] as $fileName) {
             $localFilePath = "uploads/{$fileName}";
+
             if ($localDisk->exists($localFilePath)) {
                 $key = "{$timestamp}_{$fileName}";
                 $disk->put($key, $localDisk->get($localFilePath));
-                $this->info("Uploaded: {$key}");
+                $this->info("Uploaded to S3: {$key}");
             } else {
-                $this->warn("File not found in storage/app/private/uploads/: {$fileName}");
+                $this->warn("File not found in storage/app/uploads/: {$fileName}");
             }
         }
 
-        // 3. List all objects in the bucket
-        $this->info("Objects in bucket '{$bucket}':");
-        $files = $disk->allFiles();
-        foreach ($files as $file) {
-            $this->line("- {$file}");
+        // List all objects
+        $this->info("Listing objects in bucket '{$bucket}':");
+        $objects = $disk->allFiles('');
+        foreach ($objects as $object) {
+            $this->line("- {$object}");
         }
 
-        // 4. Download each file into storage/app/downloads/
-        foreach ($files as $file) {
-            $localDownloadPath = "downloads/{$file}";
-            $localDisk->put($localDownloadPath, $disk->get($file));
-            $this->info("Downloaded to storage/app/{$localDownloadPath}");
+        // Download all objects back to local storage (inside storage/app/downloaded/)
+        foreach ($objects as $object) {
+            $localDownloadPath = "downloads/{$object}";
+            $localDisk->put($localDownloadPath, $disk->get($object));
+            $this->info("Downloaded: {$localDownloadPath}");
         }
 
-        // 5. Delete each object from S3
-        foreach ($files as $file) {
-            $disk->delete($file);
-            $this->info("Deleted from S3: {$file}");
+        // Delete all objects
+        foreach ($objects as $object) {
+            $disk->delete($object);
+            $this->info("Deleted: {$object}");
         }
 
-        $this->info("Finished S3 Laravel Storage demo. Local files are inside storage/app/uploads/ and storage/app/downloads/");
+        $this->info('S3 Laravel Storage command completed successfully.');
+
+        return CommandAlias::SUCCESS;
     }
 }
