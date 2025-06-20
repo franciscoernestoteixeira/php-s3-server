@@ -279,16 +279,58 @@ switch ($method) {
         break;
 
     case 'DELETE':
-        $f = "$bucketDir/$key";
-        if (is_file($f)) {
-            unlink($f);
-            http_response_code(204);
-            logMessage("Object deleted: $bucket/$key");
+        if ($bucket !== '' && $key === '') {
+            // DeleteBucket (recursive)
+            if (!is_dir($bucketDir)) {
+                http_response_code(404);
+                header('Content-Type: application/xml');
+                echo "<Error><Code>NoSuchBucket</Code><Message>Bucket not found</Message></Error>";
+                logMessage("Bucket not found for deletion: $bucketDir");
+                exit;
+            }
+
+            // Recursive delete helper
+            function deleteDirectory(string $dir): bool
+            {
+                $items = array_diff(scandir($dir), ['.', '..']);
+                foreach ($items as $item) {
+                    $path = "$dir/$item";
+                    if (is_dir($path)) {
+                        deleteDirectory($path);
+                    } else {
+                        unlink($path);
+                    }
+                }
+                return rmdir($dir);
+            }
+
+            if (deleteDirectory($bucketDir)) {
+                http_response_code(204);
+                logMessage("Bucket deleted recursively: $bucket");
+            } else {
+                http_response_code(500);
+                header('Content-Type: application/xml');
+                echo "<Error><Code>InternalError</Code><Message>Failed to delete bucket directory</Message></Error>";
+                logMessage("Failed to delete bucket directory: $bucketDir");
+            }
+        } elseif ($key !== '') {
+            // DeleteObject
+            $f = "$bucketDir/$key";
+            if (is_file($f)) {
+                unlink($f);
+                http_response_code(204);
+                logMessage("Object deleted: $bucket/$key");
+            } else {
+                http_response_code(404);
+                header('Content-Type: application/xml');
+                echo "<Error><Code>NoSuchKey</Code><Message>Object not found</Message></Error>";
+                logMessage("Delete failed, not found: $bucket/$key");
+            }
         } else {
-            http_response_code(404);
+            http_response_code(400);
             header('Content-Type: application/xml');
-            echo "<Error><Code>NoSuchKey</Code><Message>Object not found</Message></Error>";
-            logMessage("Delete failed, not found: $bucket/$key");
+            echo "<Error><Code>InvalidRequest</Code><Message>Invalid DELETE request</Message></Error>";
+            logMessage("Invalid DELETE request: bucket='$bucket' key='$key'");
         }
         break;
 
